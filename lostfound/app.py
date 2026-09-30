@@ -144,6 +144,10 @@ def _parse_multipart(body: bytes, content_type: str) -> dict[str, str]:
     return fields
 
 
+def _query_location(token: str) -> str:
+    return "/query?token=" + urllib.parse.quote(token.strip(), safe="")
+
+
 def _match(template: str, path: str) -> list[str] | None:
     t_parts = [p for p in template.strip("/").split("/") if p]
     p_parts = [p for p in path.strip("/").split("/") if p]
@@ -275,7 +279,16 @@ class App:
             if claim is None:
                 return self.html(render.query_form(token, req.is_staff, ("err", "查询凭证不正确，请核对后重试。")))
             active = repository.get_active_code_for_claim(self.conn(), claim["id"])
-            return self.html(render.query_result(claim, active, req.is_staff, plain_code=self._plain_code(active)))
+            return self.html(render.query_result(
+                claim, active, req.is_staff,
+                plain_code=self._plain_code(active), token=token,
+            ))
+
+        if p == "/withdraw/confirm" and m == "GET":
+            return self.withdraw_confirm(req, flash)
+
+        if p == "/withdraw" and m == "POST":
+            return self.withdraw_claim(req)
 
         if m == "GET" and (parts := _match("/items/{id}", p)):
             item = repository.get_item(self.conn(), int(parts[0]))
@@ -377,6 +390,52 @@ class App:
             raise ValueError("填写内容超出长度限制。")
         token = repository.create_claim(self.conn(), item_id, answer, contact)
         return self.html(render.claim_created(item_id, token))
+
+    def withdraw_confirm(self, req: Request, flash: Flash | None) -> Response:
+        token = req.query.get("token", "").strip()
+        if not token:
+            return Response.redirect("/query", ("err", "请先输入查询凭证。"))
+        claim = repository.get_claim_by_token(self.conn(), token)
+        if claim is None:
+            return self.html(render.query_form(token, req.is_staff, ("err", "查询凭证不正确，请核对后重试。")))
+        # 已撤回 / 已交还：不提供确认撤回页，直接回查询结果（查询页也无撤回入口）。
+        if claim["status"] == "withdrawn":
+            return Response.redirect(_query_location(token), ("info", "这份申请此前已撤回。"))
+        if claim["item_status"] == "returned":
+            return Response.redirect(
+                _query_location(token), ("err", "物品已交还，不能撤回认领申请。")
+            )
+        return self.html(render.withdraw_confirm(claim, token, req.is_staff, flash))
+
+    def withdraw_claim(self, req: Request) -> Response:
+        form = req.form()
+        token = form.get("token", "").strip()
+        if not token:
+            return Response.redirect("/query", ("err", "缺少查询凭证，无法撤回。"))
+        result = repository.withdraw_claim_by_token(self.conn(), token)
+        if not result["ok"]:
+            claim = repository.get_claim_by_token(self.conn(), token)
+            if claim is None:
+                return self.html(render.query_form(token, req.is_staff, ("err", result["reason"])))
+            return Response.redirect(_query_location(token), ("err", result["reason"]))
+        if result.get("already"):
+            return Response.redirect(_query_location(token), ("info", "该申请此前已撤回，未重复处理。"))
+        if result.get("was_selected"):
+            if result.get("item_status") == "kept":
+                n = int(result.get("restored") or 0)
+                restore_note = (
+                    f"另有 {n} 份申请恢复待核对，" if n else "没有其他待恢复的申请，"
+                )
+                msg = (
+                    "已撤回：你的交还码已立即作废，本次不会再获选。"
+                    f"物品仍在保管中，{restore_note}并继续接受新的认领申请。"
+                )
+            else:
+                msg = "已撤回：你的交还码已立即作废，本次不会再获选。物品此前已撤下，不再接受新申请。"
+            return Response.redirect(_query_location(token), ("ok", msg))
+        return Response.redirect(
+            _query_location(token), ("ok", "已撤回你的认领申请，本凭证仍可查询「已撤回」状态。")
+        )
 
     def staff_login(self, req: Request) -> Response:
         form = req.form()

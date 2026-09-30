@@ -67,3 +67,44 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
         for name, ddl in columns.items():
             if name not in existing:
                 conn.execute(ddl)
+    _migrate_claims_withdrawn(conn)
+
+
+def _migrate_claims_withdrawn(conn: sqlite3.Connection) -> None:
+    """旧库升级：claims 增加 withdrawn 状态与 withdrawn_at 列。
+
+    CHECK 约束与新列无法用 ALTER TABLE 直接修改/插入到指定位置，
+    因此检测到旧结构时重建表并搬移全部数据；新库（建表脚本已含
+     withdrawn_at）检测到列存在即跳过，保持幂等。
+    """
+    existing = {r[1] for r in conn.execute("PRAGMA table_info(claims)")}
+    if "withdrawn_at" in existing:
+        return
+    fk_on = conn.execute("PRAGMA foreign_keys").fetchone()[0]
+    conn.execute("PRAGMA foreign_keys=OFF")
+    try:
+        conn.executescript(
+            """
+            ALTER TABLE claims RENAME TO claims_old;
+            CREATE TABLE claims (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                item_id      INTEGER NOT NULL REFERENCES items(id),
+                answer       TEXT    NOT NULL,
+                contact      TEXT    NOT NULL,
+                token_hash   TEXT    NOT NULL UNIQUE,
+                status       TEXT    NOT NULL DEFAULT 'pending'
+                               CHECK (status IN ('pending', 'selected', 'rejected', 'withdrawn')),
+                created_at   TEXT    NOT NULL,
+                decided_at   TEXT,
+                withdrawn_at TEXT
+            );
+            INSERT INTO claims
+                (id, item_id, answer, contact, token_hash, status, created_at, decided_at)
+                SELECT id, item_id, answer, contact, token_hash, status, created_at, decided_at
+                FROM claims_old;
+            DROP TABLE claims_old;
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_claims_item ON claims(item_id)")
+    finally:
+        conn.execute(f"PRAGMA foreign_keys={'ON' if fk_on else 'OFF'}")

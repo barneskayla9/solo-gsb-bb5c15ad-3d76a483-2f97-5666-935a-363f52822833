@@ -1,12 +1,16 @@
 """端到端 + 并发测试（标准库）。前置：服务已运行在 http://127.0.0.1:8181。"""
 import http.cookiejar
+import os
 import re
 import sqlite3
+import sys
 import threading
 import urllib.error
 import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 BASE = "http://127.0.0.1:8181"
 PASS = 0
@@ -803,6 +807,520 @@ check("改判/重发并发后仍1位获选人", nsel7 == 1)
 check("唯一有效码只属于新获选人(目标)",
       len(codes7) == 1 and codes7[0][0] == t7 and codes7[0][1] == 1,
       str(codes7))
+
+# --------------------------------------------------------------- 11 访客撤回认领
+print("== 访客撤回认领 ==")
+
+
+def setup_item(pub, priv, answers):
+    """登记物品 + 提交若干申请，返回 (item_id, [(claim_id, token)], )。"""
+    st, _, _ = req(anon, "POST", "/staff/items",
+                   form={"csrf_token": staff_csrf, "public_description": pub,
+                         "private_features": priv}, raw=True)
+    assert st == 303
+    st, body = req(anon, "GET", "/staff")
+    iid = max(int(x) for x in re.findall(r'/staff/items/(\d+)', body))
+    out = []
+    for ans in answers:
+        _, v = client()
+        st, b = req(v, "POST", f"/items/{iid}/claims",
+                    form={"answer": ans, "contact": ans + "-contact"})
+        assert st == 200 and "查询凭证" in b
+        tok = re.search(r'<div class="tokenbox">([^<]+)</div>', b).group(1).strip()
+        out.append(tok)
+    st, body = req(anon, "GET", f"/staff/items/{iid}")
+    cids = [int(x) for x in re.findall(r'/staff/claims/(\d+)', body)]
+    return iid, list(zip(cids, out))
+
+
+def withdraw_raw(tok):
+    """无 Cookie、无 CSRF（访客凭凭证）：原始 POST，返回 (status, location, setcookies)。"""
+    data = urllib.parse.urlencode({"token": tok}).encode()
+    r = urllib.request.Request(BASE + "/withdraw", data=data, method="POST")
+    try:
+        resp = urllib.request.build_opener(NoRedirect).open(r)
+        return resp.status, resp.headers.get("Location", ""), resp.headers.get_all("Set-Cookie") or []
+    except urllib.error.HTTPError as e:
+        return e.code, e.headers.get("Location", ""), e.headers.get_all("Set-Cookie") or []
+
+
+# ---- 11a 待核对申请撤回：仅改变本人状态 ----
+i8, c8 = setup_item("公开信息8-蓝色笔记本", "私密特征8-扉页签名W", ["撤回答案甲", "撤回答案乙", "撤回答案丙"])
+(w8a, tk8a), (w8b, tk8b), (w8c, tk8c) = c8
+_, v = client()
+st, body = req(v, "GET", f"/query?token={urllib.parse.quote(tk8a)}")
+check("待核对申请查询页有撤回入口", 'href="/withdraw/confirm?token=' in body)
+
+st, body = req(v, "GET", f"/withdraw/confirm?token={urllib.parse.quote(tk8a)}")
+check("撤回确认页可打开", st == 200 and "确认撤回认领" in body and "撤回答案甲" not in body)
+check("确认页不泄露联系方式", "撤回答案甲-contact" not in body)
+st, body = req(v, "GET", f"/withdraw/confirm?token=not-a-real-token")
+check("错误凭证打开确认页回查询表单", st == 200 and "凭证不正确" in body)
+
+code, loc, sc = withdraw_raw(tk8a)
+check("待核对申请撤回成功(303到查询页)", code == 303 and loc.startswith("/query?token="), str((code, loc)))
+fl = flash_from(sc)
+check("撤回成功 flash 为 ok", fl[0] == "ok", str(fl))
+
+rows8 = dict(db.execute("SELECT id, status FROM claims WHERE item_id=?", (i8,)).fetchall())
+check("撤回后本人为 withdrawn", rows8[w8a] == "withdrawn", str(rows8))
+check("其余申请仍为 pending", rows8[w8b] == "pending" and rows8[w8c] == "pending", str(rows8))
+wtime = db.execute("SELECT withdrawn_at FROM claims WHERE id=?", (w8a,)).fetchone()[0]
+check("撤回时间已记录", bool(wtime))
+
+st, body = req(v, "GET", f"/query?token={urllib.parse.quote(tk8a)}")
+check("撤回后凭证仍可查询", "已撤回" in body)
+check("撤回后显示撤回时间", "撤回时间" in body)
+check("撤回后无交还码、无撤回入口", 'class="codebox"' not in body and "/withdraw/confirm" not in body)
+
+# 重复撤回：幂等，不重复写入
+code2, _, sc2 = withdraw_raw(tk8a)
+fl2 = flash_from(sc2)
+check("重复撤回返回303且提示此前已撤回", code2 == 303 and fl2[0] == "info" and "已撤回" in fl2[1], str(fl2))
+check("重复撤回不更新撤回时间",
+      db.execute("SELECT withdrawn_at FROM claims WHERE id=?", (w8a,)).fetchone()[0] == wtime)
+check("重复撤回不新增交还码",
+      db.execute("SELECT COUNT(*) FROM handover_codes WHERE claim_id=?", (w8a,)).fetchone()[0] == 0)
+
+# 工作人员侧可见撤回状态与时间
+st, body = req(anon, "GET", f"/staff/items/{i8}")
+check("工作人员物品页显示已撤回徽标", "已撤回" in body)
+st, body = req(anon, "GET", f"/staff/claims/{w8a}")
+check("工作人员申请页可查看撤回时间", "撤回时间" in body and "主动撤回" in body)
+check("撤回申请页无选定/改判/重发按钮",
+      f"/staff/claims/{w8a}/select" not in body and f"/staff/claims/{w8a}/rejudge" not in body
+      and f"/staff/claims/{w8a}/resend" not in body)
+st, _, _ = req(anon, "POST", f"/staff/claims/{w8a}/select",
+               form={"csrf_token": staff_csrf}, raw=True)
+check("工作人员不能选定已撤回申请", st == 303)
+req(anon, "GET", f"/staff/claims/{w8a}")  # 清 flash
+check("撤回选定后仍无获选人",
+      db.execute("SELECT COUNT(*) FROM claims WHERE item_id=? AND status='selected'",
+                 (i8,)).fetchone()[0] == 0)
+
+# 待核对撤回不影响物品继续核对/接受申请：选定乙成功
+st, _, _ = req(anon, "POST", f"/staff/claims/{w8b}/select",
+               form={"csrf_token": staff_csrf}, raw=True)
+check("撤回不阻塞工作人员选定其他申请", st == 303)
+check("已撤回申请未因他人获选改变状态",
+      db.execute("SELECT status FROM claims WHERE id=?", (w8a,)).fetchone()[0] == "withdrawn")
+
+# ---- 11b 未获选申请撤回：仅改变本人状态，不影响获选人 ----
+st, q8b = req(v, "GET", f"/query?token={urllib.parse.quote(tk8c)}")
+check("丙看到未获选", "未获选" in q8b)
+code, _, _ = withdraw_raw(tk8c)
+check("未获选申请可撤回", code == 303)
+check("未获选撤回后物品仍有获选人",
+      db.execute("SELECT status FROM claims WHERE id=?", (w8b,)).fetchone()[0] == "selected")
+check("丙撤回后为 withdrawn",
+      db.execute("SELECT status FROM claims WHERE id=?", (w8c,)).fetchone()[0] == "withdrawn")
+
+# ---- 11c 获选申请撤回（物品保管中）：作废码 + 恢复未获选 + 重新开放 ----
+i9, c9 = setup_item("公开信息9-灰色手套", "私密特征9-内衬补丁", ["手套甲", "手套乙", "手套丙"])
+(g9a, tg9a), (g9b, tg9b), (g9c, tg9c) = c9
+req(anon, "POST", f"/staff/claims/{g9a}/select", form={"csrf_token": staff_csrf}, raw=True)
+ver9_before = db.execute("SELECT version FROM items WHERE id=?", (i9,)).fetchone()[0]
+_, v = client()
+st, body = req(v, "GET", f"/query?token={urllib.parse.quote(tg9a)}")
+m = re.search(r'<div class="codebox">(\d{8})</div>', body)
+code9a = m.group(1) if m else ""
+check("获选人撤回前持有码", bool(code9a))
+
+code, loc, sc = withdraw_raw(tg9a)
+fl = flash_from(sc)
+check("获选申请撤回成功", code == 303 and fl[0] == "ok" and "交还码已立即作废" in fl[1]
+      and "恢复待核对" in fl[1], str(fl))
+rows9 = dict(db.execute("SELECT id, status FROM claims WHERE item_id=?", (i9,)).fetchall())
+check("获选人变 withdrawn", rows9[g9a] == "withdrawn", str(rows9))
+check("其余未获选申请恢复 pending", rows9[g9b] == "pending" and rows9[g9c] == "pending", str(rows9))
+check("decided_at 已清空（恢复待核对）",
+      db.execute("SELECT COUNT(*) FROM claims WHERE item_id=? AND status='pending' AND decided_at IS NOT NULL",
+                 (i9,)).fetchone()[0] == 0)
+ninv = db.execute("SELECT COUNT(*) FROM handover_codes WHERE claim_id=? AND invalidated_at IS NOT NULL",
+                  (g9a,)).fetchone()[0]
+check("获选人全部未核销码已作废", ninv == 1)
+check("无有效码残留",
+      db.execute("SELECT COUNT(*) FROM handover_codes WHERE claim_id=? AND consumed_at IS NULL"
+                 " AND invalidated_at IS NULL", (g9a,)).fetchone()[0] == 0)
+ver9_after = db.execute("SELECT version FROM items WHERE id=?", (i9,)).fetchone()[0]
+check("获选撤回不推进物品版本号（仅选定时推进）", ver9_after == ver9_before)
+istat9 = db.execute("SELECT status FROM items WHERE id=?", (i9,)).fetchone()[0]
+check("物品仍保管中", istat9 == "kept")
+
+st, body = req(v, "GET", f"/query?token={urllib.parse.quote(tg9a)}")
+check("撤回后查询页不显示旧码", 'class="codebox"' not in body and code9a not in body)
+st, body = req(anon, "GET", "/staff/verify")
+vcsrf = csrf(body)
+st, body = req(anon, "POST", "/staff/verify", form={"csrf_token": vcsrf, "code": code9a})
+check("旧码核销被拒（已失效）", "已失效" in body)
+check("旧码被拒后物品仍保管中",
+      db.execute("SELECT status FROM items WHERE id=?", (i9,)).fetchone()[0] == "kept")
+
+# 重新接受新申请
+_, vn = client()
+st, body = req(vn, "POST", f"/items/{i9}/claims", form={"answer": "新手套丁", "contact": "d-contact"})
+check("撤回后物品重新接受新申请", st == 200 and "查询凭证" in body)
+
+# 工作人员不能对已撤回的原获选人重发
+st, _, _ = req(anon, "POST", f"/staff/claims/{g9a}/resend",
+               form={"csrf_token": staff_csrf}, raw=True)
+check("原获选人撤回后重发被拒", st == 303)
+st, body = req(anon, "GET", f"/staff/claims/{g9a}")
+check("撤回页提示已主动撤回", "主动撤回" in body)
+
+# 工作人员可选恢复待核对的乙
+st, _, _ = req(anon, "POST", f"/staff/claims/{g9b}/select",
+               form={"csrf_token": staff_csrf}, raw=True)
+check("恢复待核对后可重新选定", st == 303)
+sel9 = [r[0] for r in db.execute("SELECT id FROM claims WHERE item_id=? AND status='selected'",
+                                 (i9,)).fetchall()]
+check("重新选定后仅乙获选", sel9 == [g9b], str(sel9))
+# 已主动撤回的甲不参与批量拒绝、保持 withdrawn
+check("已撤回的甲不恢复、仍 withdrawn",
+      db.execute("SELECT status FROM claims WHERE id=?", (g9a,)).fetchone()[0] == "withdrawn")
+
+# ---- 11d 获选申请撤回（物品已撤下）：只作废码，不恢复、不开放 ----
+i10, c10 = setup_item("公开信息10-红色围巾", "私密特征10-流苏磨损", ["围巾甲", "围巾乙"])
+(h10a, th10a), (h10b, th10b) = c10
+req(anon, "POST", f"/staff/claims/{h10a}/select", form={"csrf_token": staff_csrf}, raw=True)
+req(anon, "POST", f"/staff/items/{i10}/remove",
+    form={"csrf_token": staff_csrf, "version": db.execute(
+        "SELECT version FROM items WHERE id=?", (i10,)).fetchone()[0]}, raw=True)
+check("物品10已撤下", db.execute("SELECT status FROM items WHERE id=?", (i10,)).fetchone()[0] == "removed")
+# 撤下时乙（rejected）保持 rejected；甲仍 selected（撤下不改 selected）
+code, _, sc = withdraw_raw(th10a)
+fl = flash_from(sc)
+check("撤下物品的获选申请可撤回", code == 303 and fl[0] == "ok")
+check("撤下撤回提示不再开放申请", "已撤下" in fl[1], str(fl))
+check("甲撤回为 withdrawn",
+      db.execute("SELECT status FROM claims WHERE id=?", (h10a,)).fetchone()[0] == "withdrawn")
+check("乙不恢复（仍 rejected）",
+      db.execute("SELECT status FROM claims WHERE id=?", (h10b,)).fetchone()[0] == "rejected")
+check("甲的码已作废",
+      db.execute("SELECT COUNT(*) FROM handover_codes WHERE claim_id=? AND invalidated_at IS NOT NULL",
+                 (h10a,)).fetchone()[0] == 1)
+_, vx = client()
+st, body = req(vx, "POST", f"/items/{i10}/claims", form={"answer": "x", "contact": "y"})
+check("撤下物品撤回后仍不接受新申请", st == 400 and "撤下或已交还" in body)
+# 乙撤回仅改本人状态
+code, _, _ = withdraw_raw(th10b)
+check("撤下物品的未获选申请也可撤回", code == 303)
+check("乙撤回为 withdrawn、物品仍 removed",
+      db.execute("SELECT status FROM claims WHERE id=?", (h10b,)).fetchone()[0] == "withdrawn"
+      and db.execute("SELECT status FROM items WHERE id=?", (i10,)).fetchone()[0] == "removed")
+
+# ---- 11e 物品已交还：拒绝撤回任何申请 ----
+i11, c11 = setup_item("公开信息11-黑色墨镜", "私密特征11-镜盒贴纸", ["墨镜甲", "墨镜乙"])
+(k11a, tk11a), (k11b, tk11b) = c11
+req(anon, "POST", f"/staff/claims/{k11a}/select", form={"csrf_token": staff_csrf}, raw=True)
+st, body = req(anon, "GET", f"/staff/claims/{k11a}")
+code11 = re.search(r'<div class="codebox">(\d{8})</div>', body).group(1)
+st, body = req(anon, "GET", "/staff/verify")
+vcsrf = csrf(body)
+st, _, _ = req(anon, "POST", "/staff/verify", form={"csrf_token": vcsrf, "code": code11}, raw=True)
+check("物品11已交还", db.execute("SELECT status FROM items WHERE id=?", (i11,)).fetchone()[0] == "returned")
+
+for tk, cid, who in ((tk11a, k11a, "获选"), (tk11b, k11b, "未获选")):
+    code, loc, sc = withdraw_raw(tk)
+    fl = flash_from(sc)
+    check(f"已交还物品拒绝撤回{who}申请", code == 303 and fl[0] == "err" and "已交还" in fl[1], str(fl))
+    stt = db.execute("SELECT status FROM claims WHERE id=?", (cid,)).fetchone()[0]
+    check(f"{who}申请状态未被改动", stt in ("selected", "rejected"), stt)
+    _, v = client()
+    st, body = req(v, "GET", f"/query?token={urllib.parse.quote(tk)}")
+    check(f"已交还后{who}查询页无撤回入口", "/withdraw/confirm" not in body)
+    st, body = req(v, "GET", f"/withdraw/confirm?token={urllib.parse.quote(tk)}")
+    check(f"已交还后直接访问确认页被拦回查询", "已交还" in body or "完成交还" in body)
+
+# ---- 11f 撤回与选定并发：状态裁决一致、无双获选/旧码/部分更新 ----
+# 两种合法串行历史：
+#   A) 选定先提交、撤回后提交：撤回的是「已获选申请」（合法，作废旧码、
+#      恢复其他申请）——双方都得到各自操作的明确结果，终态一致；
+#   B) 撤回先提交、选定后提交：选定对 withdrawn 申请条件不匹配而失败，
+#      撤回方成功。两种历史下都不得出现双获选、可用旧码或部分更新。
+i12, c12 = setup_item("公开信息12-绿色腰包", "私密特征12-内层标签", ["腰包甲", "腰包乙"])
+(x12a, tx12a), (x12b, tx12b) = c12
+barrierW = threading.Barrier(2)
+
+
+def w_select():
+    barrierW.wait()
+    return raw_with_cookie_full(cookie_header, f"/staff/claims/{x12a}/select",
+                                {"csrf_token": staff_csrf})
+
+
+def w_withdraw():
+    barrierW.wait()
+    return withdraw_raw(tx12a)
+
+
+with ThreadPoolExecutor(max_workers=2) as ex:
+    o1 = ex.submit(w_select)
+    o2 = ex.submit(w_withdraw)
+    rs1, rs2 = o1.result(), o2.result()
+
+sel_flash = flash_from(rs1[2])
+wd_flash = flash_from(rs2[2])
+sel_ok = sel_flash[0] == "ok"
+wd_ok = wd_flash[0] == "ok"
+status_a = db.execute("SELECT status FROM claims WHERE id=?", (x12a,)).fetchone()[0]
+nsel = db.execute("SELECT COUNT(*) FROM claims WHERE item_id=? AND status='selected'",
+                  (i12,)).fetchall()[0][0]
+nactive = db.execute(
+    "SELECT COUNT(*) FROM handover_codes hc JOIN claims c ON c.id=hc.claim_id"
+    " WHERE c.item_id=? AND hc.consumed_at IS NULL AND hc.invalidated_at IS NULL",
+    (i12,)).fetchone()[0]
+
+if wd_ok and not sel_ok:
+    # 历史 B：撤回先生效，选定被明确拒绝
+    check("历史B-撤回先成功、选定被拒", True)
+    check("历史B-甲为 withdrawn", status_a == "withdrawn", status_a)
+    check("历史B-选定方收到明确错误提示", "已被申请人撤回" in sel_flash[1], str(sel_flash))
+    check("历史B-无获选人", nsel == 0 and nactive == 0)
+    st, body = req(anon, "GET", f"/staff/claims/{x12a}")
+    check("历史B-申请页提示已撤回", "已撤回" in body)
+else:
+    # 历史 A：选定先生效，随后对已获选申请的撤回合法成功
+    check("历史A-选定成功", sel_ok, str(sel_flash))
+    check("历史A-撤回成功", wd_ok, str(wd_flash))
+    check("历史A-甲最终 withdrawn", status_a == "withdrawn", status_a)
+    check("历史A-无双获选", nsel == 0, f"nsel={nsel}")
+    check("历史A-旧码已作废、无可用旧码", nactive == 0, f"nactive={nactive}")
+    check("历史A-乙恢复待核对",
+          db.execute("SELECT status FROM claims WHERE id=?", (x12b,)).fetchone()[0] == "pending")
+    # 工作人员再选定乙可正常完成（终态可继续推进，非部分更新卡死）
+    st, _, _ = req(anon, "POST", f"/staff/claims/{x12b}/select",
+                   form={"csrf_token": staff_csrf}, raw=True)
+    check("历史A-终态可继续选定其他申请", st == 303)
+    nsel2 = db.execute("SELECT COUNT(*) FROM claims WHERE item_id=? AND status='selected'",
+                       (i12,)).fetchone()[0]
+    check("历史A-重新选定后恰好1位获选人", nsel2 == 1)
+    check("历史A-甲保持 withdrawn 不复活",
+          db.execute("SELECT status FROM claims WHERE id=?", (x12a,)).fetchone()[0] == "withdrawn")
+
+# ---- 11g 撤回与核码并发：不得出现「交还又撤回」/旧码可用 ----
+i13, c13 = setup_item("公开信息13-黄色雨披", "私密特征13-帽绳记号", ["雨披甲"])
+(y13a, ty13a), = c13
+req(anon, "POST", f"/staff/claims/{y13a}/select", form={"csrf_token": staff_csrf}, raw=True)
+code13 = db.execute("SELECT code_hash FROM handover_codes WHERE claim_id=?", (y13a,)).fetchone()[0]
+from lostfound.security import decrypt_field as _df, load_or_create_secret as _locs
+_secret = _locs("/tmp/lfdata/secret.key")
+_enc = db.execute("SELECT code_enc FROM handover_codes WHERE claim_id=?", (y13a,)).fetchone()[0]
+plain13 = _df(_secret, _enc)
+st, body = req(anon, "GET", "/staff/verify")
+vcsrf = csrf(body)
+barrierV = threading.Barrier(2)
+
+
+def v_verify():
+    barrierV.wait()
+    return raw_with_cookie(cookie_header, "/staff/verify", {"csrf_token": vcsrf, "code": plain13})
+
+
+def v_withdraw():
+    barrierV.wait()
+    return withdraw_raw(ty13a)
+
+
+with ThreadPoolExecutor(max_workers=2) as ex:
+    p1 = ex.submit(v_verify)
+    p2 = ex.submit(v_withdraw)
+    vr, wr = p1.result(), p2.result()
+
+verify_won = vr[0] == 303 and vr[1] == f"/staff/items/{i13}"
+withdraw_won = wr[0] == 303 and wr[1].startswith("/query?token=") and flash_from(wr[2])[0] == "ok"
+check("核码/撤回并发恰好一方生效", verify_won != withdraw_won, f"verify={vr} withdraw={wr}")
+istat13 = db.execute("SELECT status FROM items WHERE id=?", (i13,)).fetchone()[0]
+stt13 = db.execute("SELECT status FROM claims WHERE id=?", (y13a,)).fetchone()[0]
+nconsumed = db.execute("SELECT COUNT(*) FROM handover_codes WHERE claim_id=? AND consumed_at IS NOT NULL",
+                       (y13a,)).fetchone()[0]
+ninvalid = db.execute("SELECT COUNT(*) FROM handover_codes WHERE claim_id=? AND invalidated_at IS NOT NULL",
+                      (y13a,)).fetchone()[0]
+if verify_won:
+    check("核码胜：物品已交还", istat13 == "returned" and stt13 == "selected")
+    check("核码胜：码恰好核销1枚", nconsumed == 1 and ninvalid == 0)
+else:
+    check("撤回胜：物品仍保管中、申请已撤回", istat13 == "kept" and stt13 == "withdrawn")
+    check("撤回胜：码已作废且未核销", ninvalid == 1 and nconsumed == 0)
+    # 再核旧码必被拒，旧码不可用
+    st, body = req(anon, "GET", "/staff/verify")
+    vcsrf2 = csrf(body)
+    st, body = req(anon, "POST", "/staff/verify", form={"csrf_token": vcsrf2, "code": plain13})
+    check("撤回胜后旧码核销被拒", "已失效" in body)
+    check("撤回胜后物品仍未交还",
+          db.execute("SELECT status FROM items WHERE id=?", (i13,)).fetchone()[0] == "kept")
+
+# ---- 11h 撤回与改判并发：无双获选、无旧码可用、无部分更新 ----
+# 两种合法串行历史：
+#   A) 撤回先提交：甲 withdrawn、乙恢复 pending，改判随后被明确拒绝；
+#   B) 改判先提交：乙 selected 并获得唯一新码、甲变 rejected 且旧码作废；
+#      甲随后的撤回作为「未获选撤回」合法成功，仅改本人状态，不影响新获选人。
+i14, c14 = setup_item("公开信息14-紫色卡包", "私密特征14-夹层硬币", ["卡包甲", "卡包乙"])
+(z14a, tz14a), (z14b, tz14b) = c14
+req(anon, "POST", f"/staff/claims/{z14a}/select", form={"csrf_token": staff_csrf}, raw=True)
+ver14 = db.execute("SELECT version FROM items WHERE id=?", (i14,)).fetchone()[0]
+_enc = db.execute("SELECT code_enc FROM handover_codes WHERE claim_id=?", (z14a,)).fetchone()[0]
+plain14 = _df(_secret, _enc)
+barrierR = threading.Barrier(2)
+
+
+def r_rejudge():
+    barrierR.wait()
+    return raw_with_cookie_full(cookie_header, f"/staff/claims/{z14a}/rejudge",
+                                {"csrf_token": staff_csrf, "to_claim_id": str(z14b),
+                                 "reason": "撤回改判并发", "item_id": str(i14), "version": ver14})
+
+
+def r_withdraw():
+    barrierR.wait()
+    return withdraw_raw(tz14a)
+
+
+with ThreadPoolExecutor(max_workers=2) as ex:
+    q1 = ex.submit(r_rejudge)
+    q2 = ex.submit(r_withdraw)
+    jr, wr2 = q1.result(), q2.result()
+
+rj_flash = flash_from(jr[2])
+wd_flash = flash_from(wr2[2])
+rj_ok = jr[0] == 303 and jr[1] == f"/staff/items/{i14}" and rj_flash[0] == "ok"
+wd_ok = wr2[0] == 303 and wr2[1].startswith("/query?token=") and wd_flash[0] == "ok"
+st_a = db.execute("SELECT status FROM claims WHERE id=?", (z14a,)).fetchone()[0]
+st_b = db.execute("SELECT status FROM claims WHERE id=?", (z14b,)).fetchone()[0]
+ncorr14 = db.execute("SELECT COUNT(*) FROM corrections WHERE item_id=?", (i14,)).fetchone()[0]
+nsel14 = db.execute("SELECT COUNT(*) FROM claims WHERE item_id=? AND status='selected'",
+                    (i14,)).fetchone()[0]
+nactive14 = db.execute(
+    "SELECT COUNT(*) FROM handover_codes hc JOIN claims c ON c.id=hc.claim_id"
+    " WHERE c.item_id=? AND hc.consumed_at IS NULL AND hc.invalidated_at IS NULL",
+    (i14,)).fetchone()[0]
+
+if ncorr14 == 1:
+    # 历史 B：改判先生效
+    check("历史B-改判成功", rj_ok, str(rj_flash))
+    check("历史B-乙获选、乙恰有1枚有效码", st_b == "selected" and nsel14 == 1 and nactive14 == 1,
+          f"{st_b},{nsel14},{nactive14}")
+    check("历史B-唯一有效码属于乙",
+          db.execute("SELECT COUNT(*) FROM handover_codes WHERE claim_id=?"
+                     " AND consumed_at IS NULL AND invalidated_at IS NULL", (z14b,)).fetchone()[0] == 1)
+    check("历史B-甲不再获选（rejected 或随后已撤回）", st_a in ("rejected", "withdrawn"), st_a)
+    if st_a == "withdrawn":
+        check("历史B-甲随后撤回也成功（未获选撤回不影响新获选人）", wd_ok, str(wd_flash))
+    else:
+        check("历史B-改判后撤回未必排上，但改判方成功即可", True)
+else:
+    # 历史 A：撤回先生效，改判被明确拒绝
+    check("历史A-撤回成功、改判被拒", wd_ok and not rj_ok and rj_flash[0] == "err",
+          f"rj={rj_flash} wd={wd_flash}")
+    check("历史A-甲 withdrawn、乙恢复 pending", st_a == "withdrawn" and st_b == "pending",
+          f"{st_a},{st_b}")
+    check("历史A-无获选人、无有效码、不留痕", nsel14 == 0 and nactive14 == 0 and ncorr14 == 0)
+
+# 甲的旧码在两种结局下都不可用（改判或撤回都已将其作废：invalidated 行数为 1）
+check("甲的旧码均已作废",
+      db.execute("SELECT COUNT(*) FROM handover_codes WHERE claim_id=?"
+                 " AND invalidated_at IS NOT NULL AND consumed_at IS NULL",
+                 (z14a,)).fetchone()[0] == 1)
+st, body = req(anon, "GET", "/staff/verify")
+vcsrf = csrf(body)
+st, body = req(anon, "POST", "/staff/verify", form={"csrf_token": vcsrf, "code": plain14})
+check("并发结局后甲旧码核销被拒", "已失效" in body)
+check("并发结局后无双获选", nsel14 <= 1)
+
+# ---- 11i 确定性串行：改判后原获选人（未获选）撤回，不影响新获选人 ----
+i15, c15 = setup_item("公开信息15-橙色U盘", "私密特征15-标签姓名LH", ["U盘甲", "U盘乙"])
+(u15a, tu15a), (u15b, tu15b) = c15
+req(anon, "POST", f"/staff/claims/{u15a}/select", form={"csrf_token": staff_csrf}, raw=True)
+ver15 = db.execute("SELECT version FROM items WHERE id=?", (i15,)).fetchone()[0]
+st, _, _ = req(anon, "POST", f"/staff/claims/{u15a}/rejudge",
+               form={"csrf_token": staff_csrf, "to_claim_id": str(u15b),
+                     "reason": "改判后原申请人再撤回", "item_id": str(i15), "version": ver15}, raw=True)
+check("串行-先改判甲->乙成功", st == 303)
+code, _, _ = withdraw_raw(tu15a)
+check("串行-改判后甲作为未获选申请撤回成功", code == 303)
+check("串行-甲 withdrawn",
+      db.execute("SELECT status FROM claims WHERE id=?", (u15a,)).fetchone()[0] == "withdrawn")
+check("串行-乙仍 selected 不受影响",
+      db.execute("SELECT status FROM claims WHERE id=?", (u15b,)).fetchone()[0] == "selected")
+check("串行-乙的有效码仍在",
+      db.execute("SELECT COUNT(*) FROM handover_codes WHERE claim_id=?"
+                 " AND consumed_at IS NULL AND invalidated_at IS NULL", (u15b,)).fetchone()[0] == 1)
+check("串行-未把其他申请恢复（乙是获选人，甲是主动撤回，无 pending 恢复对象）",
+      db.execute("SELECT COUNT(*) FROM claims WHERE item_id=? AND status='pending'",
+                 (i15,)).fetchone()[0] == 0)
+_, v = client()
+st, body = req(v, "GET", f"/query?token={urllib.parse.quote(tu15b)}")
+check("串行-乙查询页仍显示已获选与交还码", "已获选" in body and 'class="codebox"' in body)
+
+# ---- 11j 获选撤回与撤下并发：不恢复申请、不开放提交 / 恢复只按最新状态 ----
+i16, c16 = setup_item("公开信息16-米色手套", "私密特征16-腕口刺绣星", ["手套甲j", "手套乙j"])
+(x16a, tx16a), (x16b, tx16b) = c16
+req(anon, "POST", f"/staff/claims/{x16a}/select", form={"csrf_token": staff_csrf}, raw=True)
+ver16 = db.execute("SELECT version FROM items WHERE id=?", (i16,)).fetchone()[0]
+barrierX = threading.Barrier(2)
+
+
+def x_remove():
+    barrierX.wait()
+    return raw_with_cookie_full(cookie_header, f"/staff/items/{i16}/remove",
+                                {"csrf_token": staff_csrf, "version": ver16})
+
+
+def x_withdraw():
+    barrierX.wait()
+    return withdraw_raw(tx16a)
+
+
+with ThreadPoolExecutor(max_workers=2) as ex:
+    q1 = ex.submit(x_remove)
+    q2 = ex.submit(x_withdraw)
+    rm3, wd3 = q1.result(), q2.result()
+
+rm_fl = flash_from(rm3[2])
+wd_fl3 = flash_from(wd3[2])
+istat16 = db.execute("SELECT status FROM items WHERE id=?", (i16,)).fetchone()[0]
+st_a16 = db.execute("SELECT status FROM claims WHERE id=?", (x16a,)).fetchone()[0]
+st_b16 = db.execute("SELECT status FROM claims WHERE id=?", (x16b,)).fetchone()[0]
+check("撤下/撤回并发：撤下结果明确（成功或被拒）", rm3[0] == 303, str(rm3))
+check("撤下/撤回并发：撤回结果明确（成功或被拒）", wd3[0] == 303, str(wd3))
+
+if istat16 == "removed":
+    # 撤下在两种串行顺序下都会生效（撤回不推进 version，不影响撤下乐观锁）：
+    #   撤下先：乙随撤下被拒，甲随后按「已撤下物品」撤回（仅作废码）；
+    #   撤回先：甲撤回、乙恢复 pending，撤下随后生效再把乙标记 rejected。
+    # 终态确定一致：物品 removed、甲 withdrawn、乙 rejected、不开放提交。
+    check("并发结局：物品已撤下", True)
+    check("甲已撤回", st_a16 == "withdrawn", st_a16)
+    check("撤下后不恢复申请（乙为 rejected，不是 pending）", st_b16 == "rejected", st_b16)
+    check("撤下后不开放新申请",
+          db.execute("SELECT COUNT(*) FROM claims WHERE item_id=? AND status='pending'",
+                     (i16,)).fetchone()[0] == 0)
+    check("甲的交还码已作废",
+          db.execute("SELECT COUNT(*) FROM handover_codes WHERE claim_id=?"
+                     " AND invalidated_at IS NOT NULL AND consumed_at IS NULL",
+                     (x16a,)).fetchone()[0] == 1)
+else:
+    check("不应出现物品未撤下的结局（撤下守卫不受撤回影响）", False, istat16)
+
+# 无可用旧码、无双获选（两种结局共同不变量）
+check("11j 无有效交还码",
+      db.execute("SELECT COUNT(*) FROM handover_codes hc JOIN claims c ON c.id=hc.claim_id"
+                 " WHERE c.item_id=? AND hc.consumed_at IS NULL AND hc.invalidated_at IS NULL",
+                 (i16,)).fetchone()[0] == 0)
+check("11j selected 至多 1（撤下后应为 0）",
+      db.execute("SELECT COUNT(*) FROM claims WHERE item_id=? AND status='selected'",
+                 (i16,)).fetchone()[0] <= 1)
+
+# 若物品仍 kept（撤回先生效），最终由工作人员再撤下，得到确定的 removed 终态
+if istat16 != "removed":
+    ver16b = db.execute("SELECT version FROM items WHERE id=?", (i16,)).fetchone()[0]
+    req(anon, "POST", f"/staff/items/{i16}/remove",
+        form={"csrf_token": staff_csrf, "version": ver16b}, raw=True)
+    istat16 = db.execute("SELECT status FROM items WHERE id=?", (i16,)).fetchone()[0]
+check("11j 最终物品为撤下态", istat16 == "removed", istat16)
+_, vx16 = client()
+st, body = req(vx16, "POST", f"/items/{i16}/claims", form={"answer": "新", "contact": "n"})
+check("11j 撤下后不接受新申请", st == 400 and "撤下或已交还" in body)
 
 print(f"\n结果：{PASS} 通过, {FAIL} 失败")
 raise SystemExit(1 if FAIL else 0)

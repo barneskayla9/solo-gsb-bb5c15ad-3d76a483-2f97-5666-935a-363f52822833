@@ -21,11 +21,12 @@ CREATE TABLE IF NOT EXISTS claims (
     answer     TEXT    NOT NULL,           -- 访客提交的辨认答案（仅工作人员可见）
     contact    TEXT    NOT NULL,           -- 联系方式（仅工作人员可见）
     token_hash TEXT    NOT NULL UNIQUE,
-    -- pending=待核对  selected=已获选  rejected=未获选
+    -- pending=待核对  selected=已获选  rejected=未获选  withdrawn=已撤回
     status     TEXT    NOT NULL DEFAULT 'pending'
-                 CHECK (status IN ('pending', 'selected', 'rejected')),
+                 CHECK (status IN ('pending', 'selected', 'rejected', 'withdrawn')),
     created_at TEXT    NOT NULL,
-    decided_at TEXT
+    decided_at TEXT,
+    withdrawn_at TEXT                    -- 申请人主动撤回时间（仅 withdrawn 状态有值）
 );
 CREATE INDEX IF NOT EXISTS idx_claims_item ON claims(item_id);
 
