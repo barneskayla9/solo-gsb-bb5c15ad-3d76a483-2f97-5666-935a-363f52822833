@@ -9,7 +9,7 @@ from . import security
 from .db import immediate_tx
 # 状态中文标签（单一事实来源，模板也使用）
 ITEM_STATUS_LABELS = {"kept": "保管中", "removed": "已撤下", "returned": "已交还"}
-CLAIM_STATUS_LABELS = {"pending": "待核对", "selected": "已获选", "rejected": "未获选"}
+CLAIM_STATUS_LABELS = {"pending": "待核对", "selected": "已获选", "rejected": "未获选", "withdrawn": "已撤回"}
 
 
 def now_iso() -> str:
@@ -171,6 +171,98 @@ def get_claim(conn: sqlite3.Connection, claim_id: int) -> sqlite3.Row | None:
     return conn.execute("SELECT * FROM claims WHERE id = ?", (claim_id,)).fetchone()
 
 
+def withdraw_claim(conn: sqlite3.Connection, token: str) -> dict[str, Any]:
+    """访客凭原查询凭证撤回本人认领。
+
+    返回 {'ok': bool, 'status': 当前(裁决时)申请状态, 'item_status': ...}：
+    成功时 status 已变为 withdrawn；失败（含重复撤回与并发冲突）时返回最新状态，
+    由调用方给出明确提示。整个裁决在单个 IMMEDIATE 事务内、针对提交时最新已
+    提交状态求值，不依赖事务开始前的读快照。
+
+    规则：
+      - 物品已交还：拒绝撤回任何申请，状态原样不动；
+      - 待核对 / 未获选：仅把本人状态置为「已撤回」；
+      - 已获选：本人置为「已撤回」，原子作废其全部未核销交还码；物品仍保管中时，
+        把同物品其余「未获选」申请恢复为待核对（已主动撤回者不恢复），物品重新
+        开放接受新申请（无 selected 即开放）；物品已撤下则不恢复、不开放；
+      - 已撤回：幂等返回成功但不重复写入（撤回时间不变、不产生新记录）。
+    """
+    token_hash = security.sha256_hex(token.strip())
+    ts = now_iso()
+    result: dict[str, Any] = {"ok": False, "status": None, "item_status": None, "repeated": False}
+    with immediate_tx(conn):
+        row = conn.execute(
+            """
+            SELECT c.id, c.status AS claim_status, i.id AS item_id, i.status AS item_status
+            FROM claims c JOIN items i ON i.id = c.item_id
+            WHERE c.token_hash = ?
+            """,
+            (token_hash,),
+        ).fetchone()
+        if row is None:
+            raise LookupError("查询凭证不正确，请核对后重试。")
+
+        claim_id, item_id = row["id"], row["item_id"]
+        claim_status, item_status = row["claim_status"], row["item_status"]
+        result["status"], result["item_status"] = claim_status, item_status
+
+        # 物品已交还：拒绝撤回任何申请。
+        if item_status == "returned":
+            return result
+
+        # 重复撤回：只显示已撤回，不重复写入。
+        if claim_status == "withdrawn":
+            result["ok"] = True
+            result["repeated"] = True
+            return result
+
+        cur = conn.execute(
+            "UPDATE claims SET status = 'withdrawn', withdrawn_at = ?"
+            " WHERE id = ? AND status != 'withdrawn'",
+            (ts, claim_id),
+        )
+        if cur.rowcount != 1:
+            # 并发下被另一操作抢先改变（如刚被交还/改判）：以最新状态裁决，不改状态。
+            latest = conn.execute(
+                "SELECT c.status AS claim_status, i.status AS item_status"
+                " FROM claims c JOIN items i ON i.id = c.item_id"
+                " WHERE c.id = ?",
+                (claim_id,),
+            ).fetchone()
+            result["status"], result["item_status"] = latest["claim_status"], latest["item_status"]
+            return result
+
+        # 待核对 / 未获选申请撤回：仅改变本人状态。
+        if claim_status != "selected":
+            result["ok"] = True
+            result["status"] = "withdrawn"
+            return result
+
+        # 已获选申请撤回：推进物品版本（让页面版本过期的工作人员改判/撤下得到
+        # 「请刷新」提示），原子作废其全部未核销交还码（已核销/已作废码保持原样）。
+        conn.execute(
+            "UPDATE items SET updated_at = ?, version = version + 1 WHERE id = ?",
+            (ts, item_id),
+        )
+        conn.execute(
+            "UPDATE handover_codes SET invalidated_at = ?"
+            " WHERE claim_id = ? AND consumed_at IS NULL AND invalidated_at IS NULL",
+            (ts, claim_id),
+        )
+        # 物品仍保管中：同物品其余「未获选」申请恢复待核对，重新进入候选；
+        # 已主动撤回（withdrawn）的申请不恢复，并清除其落选标记时间。
+        # 物品已撤下则不恢复、不开放提交（create_claim 仍按物品状态拒绝）。
+        if item_status == "kept":
+            conn.execute(
+                "UPDATE claims SET status = 'pending', decided_at = NULL"
+                " WHERE item_id = ? AND status = 'rejected'",
+                (item_id,),
+            )
+        result["ok"] = True
+        result["status"] = "withdrawn"
+    return result
+
+
 def select_claim(conn: sqlite3.Connection, claim_id: int, code_ttl_seconds: int, key: bytes) -> str:
     """选定一份认领并签发首个一次性交还码。
 
@@ -210,6 +302,8 @@ def select_claim(conn: sqlite3.Connection, claim_id: int, code_ttl_seconds: int,
             existing = get_claim(conn, claim_id)
             if existing is not None and existing["status"] == "rejected":
                 raise ValueError("该申请已因他人获选而标记为未获选")
+            if existing is not None and existing["status"] == "withdrawn":
+                raise ValueError("该申请已被申请人主动撤回，不能选定")
             raise ValueError("该申请已经处理，不能重复选定")
 
         conn.execute(
@@ -477,13 +571,18 @@ def consume_code(conn: sqlite3.Connection, code: str) -> dict[str, Any]:
             (hc["claim_id"],),
         )
         if claim_guard.fetchone() is None:
-            raise RuntimeError("申请状态已变更，回滚本次核销")
+            # 并发改判 / 撤回已使该申请不再是获选人：整笔回滚，明确拒绝核码。
+            return {"ok": False, "reason": "该申请状态已变更（改判或撤回），交还码不能核销"}
         upd = conn.execute(
             "UPDATE items SET status = 'returned', updated_at = ?"
             " WHERE id = ? AND status = 'kept' AND version = ?",
             (ts, hc["item_id"], hc["item_version"]),
         )
         if upd.rowcount != 1:
-            raise RuntimeError("物品状态异常，回滚本次核销")
+            # 并发撤下 / 获选人撤回 / 改判 / 另一核码已改变物品：回滚并明确拒绝。
+            cur_item = conn.execute("SELECT status FROM items WHERE id = ?", (hc["item_id"],)).fetchone()
+            if cur_item is not None and cur_item["status"] == "returned":
+                return {"ok": False, "reason": "该物品已登记交还，不能重复核销"}
+            return {"ok": False, "reason": "物品状态刚被其他操作改变（撤下/撤回/改判），请刷新确认后再核码"}
         result = {"ok": True, "claim_id": hc["claim_id"], "item_id": hc["item_id"]}
     return result

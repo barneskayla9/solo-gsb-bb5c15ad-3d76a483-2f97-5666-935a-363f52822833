@@ -36,6 +36,19 @@ SESSION_MAX_AGE = 12 * 3600
 
 Flash = tuple[str, str]
 
+
+class _RowWithToken:
+    """包装 sqlite3.Row，额外携带本次查询使用的凭证明文（仅请求内存，用于撤回表单）。"""
+
+    def __init__(self, row: Any, token_plain: str):
+        self._row = row
+        self.token_plain = token_plain
+
+    def __getitem__(self, key: str) -> Any:
+        if key == "token_plain":
+            return self.token_plain
+        return self._row[key]
+
 # ----------------------------------------------------------------- 请求/响应
 
 class Request:
@@ -275,7 +288,13 @@ class App:
             if claim is None:
                 return self.html(render.query_form(token, req.is_staff, ("err", "查询凭证不正确，请核对后重试。")))
             active = repository.get_active_code_for_claim(self.conn(), claim["id"])
-            return self.html(render.query_result(claim, active, req.is_staff, plain_code=self._plain_code(active)))
+            # 附上凭证明文，供查询页撤回表单回传（仅本请求内存中，不落库）。
+            claim = _RowWithToken(claim, token)
+            return self.html(
+                render.query_result(
+                    claim, active, req.is_staff, plain_code=self._plain_code(active), flash=flash
+                )
+            )
 
         if m == "GET" and (parts := _match("/items/{id}", p)):
             item = repository.get_item(self.conn(), int(parts[0]))
@@ -285,6 +304,9 @@ class App:
 
         if m == "POST" and (parts := _match("/items/{id}/claims", p)):
             return self.submit_claim(req, int(parts[0]))
+
+        if p == "/claims/withdraw" and m == "POST":
+            return self.withdraw_claim(req)
 
         # ---- 工作人员登录 ----
         if p == "/staff/login" and m == "GET":
@@ -377,6 +399,33 @@ class App:
             raise ValueError("填写内容超出长度限制。")
         token = repository.create_claim(self.conn(), item_id, answer, contact)
         return self.html(render.claim_created(item_id, token))
+
+    def withdraw_claim(self, req: Request) -> Response:
+        """访客凭原查询凭证撤回本人认领（无工作人员会话，凭证即授权依据）。"""
+        token = req.form().get("token", "").strip()
+        if not token:
+            return Response.redirect("/query", ("err", "请填写查询凭证后再撤回。"))
+        try:
+            outcome = repository.withdraw_claim(self.conn(), token)
+        except LookupError as exc:
+            return self.html(
+                render.query_form(token, req.is_staff, ("err", str(exc))), "404 Not Found"
+            )
+        qs = urllib.parse.urlencode({"token": token})
+        if outcome["ok"] and not outcome["repeated"]:
+            return Response.redirect(
+                f"/query?{qs}", ("ok", "已撤回你的认领申请。撤回后可继续用本凭证查询状态。")
+            )
+        if outcome["ok"]:  # 重复撤回：幂等，仅展示已撤回，不重复写入
+            return Response.redirect(f"/query?{qs}", ("info", "该申请此前已撤回，无需重复操作。"))
+        # 失败：按裁决时最新状态给出明确提示，不改动任何状态。
+        if outcome["item_status"] == "returned":
+            msg = "该物品已交还，不能撤回认领申请。"
+        elif outcome["status"] == "selected":
+            msg = "申请状态刚被工作人员处理，请刷新查询页确认最新状态后再试。"
+        else:
+            msg = "申请状态已改变，不能撤回，请刷新查询页确认最新状态。"
+        return Response.redirect(f"/query?{qs}", ("err", msg))
 
     def staff_login(self, req: Request) -> Response:
         form = req.form()

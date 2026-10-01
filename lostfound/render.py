@@ -63,6 +63,7 @@ h2{font-size:17px;margin:0 0 10px}
 .badge-kept,.badge-selected{background:#dcfce7;color:var(--ok)}
 .badge-pending{background:#fef9c3;color:#854d0e}
 .badge-removed,.badge-rejected{background:#fee2e2;color:var(--err)}
+.badge-withdrawn{background:#e5e7eb;color:#374151}
 .badge-returned{background:#dbeafe;color:#1d4ed8}
 table{width:100%;border-collapse:collapse;font-size:14px}
 th,td{border-bottom:1px solid var(--line);padding:9px 8px;text-align:left;vertical-align:top}
@@ -217,7 +218,8 @@ def query_form(token: str = "", staff: bool = False, flash: tuple[str, str] | No
 
 
 def query_result(
-    claim: Any, active_code: Any, staff: bool, *, plain_code: str | None = None
+    claim: Any, active_code: Any, staff: bool, *, plain_code: str | None = None,
+    flash: tuple[str, str] | None = None,
 ) -> str:
     status = claim["status"]
     lines = [
@@ -226,6 +228,7 @@ def query_result(
         f"<dt>提交时间</dt><dd>{fmt_time(claim['created_at'])}</dd>",
     ]
     extra = ""
+    withdraw_form = ""
     if status == "selected":
         if active_code is not None and not active_code["consumed_at"] and not active_code["invalidated_at"]:
             expires = active_code["expires_at"]
@@ -259,12 +262,39 @@ def query_result(
         else:
             tip = "工作人员已选定其他获选人，本次申请未获选。"
         lines.append(f"<dt>说明</dt><dd>{e(tip)}</dd>")
+    elif status == "withdrawn":
+        lines.append(f"<dt>撤回时间</dt><dd>{fmt_time(claim['withdrawn_at'])}</dd>")
+        lines.append(
+            "<dt>说明</dt><dd>你已主动撤回本申请，不会再被选定或显示交还码；"
+            "本凭证仍可随时查询该状态。</dd>"
+        )
+
+    # 撤回入口：已交还物品不可撤回；已撤回不重复展示撤回表单。
+    if status != "withdrawn" and claim["item_status"] != "returned":
+        if status == "selected":
+            warn = (
+                "撤回后本人状态变为「已撤回」、未使用的交还码立即作废；"
+                "若物品仍在保管，工作人员将重新核对其他申请并重新接受新申请。"
+            )
+        else:
+            warn = "撤回后本人状态变为「已撤回」，不会再被选定。"
+        withdraw_form = f"""
+        <div class="card">
+          <h1>撤回我的认领</h1>
+          <p class="muted">{e(warn)} 物品若已交还则无法撤回。撤回后本凭证仍可查询「已撤回」状态。</p>
+          <form method="post" action="/claims/withdraw"
+            onsubmit="return confirm('确定撤回这份认领申请？撤回后将不再获选、交还码立即作废。')">
+            <input type="hidden" name="token" value="{e(claim['token_plain'])}">
+            <div class="row"><button class="btn danger" type="submit">确认撤回认领</button></div>
+          </form>
+        </div>"""
     body = (
         f'<div class="card"><h1>我的认领进度</h1><dl class="info">{"".join(lines)}</dl>'
         '<div class="row"><a class="btn secondary" href="/query">再查一个凭证</a></div></div>'
         + extra
+        + withdraw_form
     )
-    return page("认领进度", body, staff=staff)
+    return page("认领进度", body, staff=staff, flash=flash)
 
 
 # ----------------------------------------------------------------- 工作人员
@@ -340,6 +370,7 @@ def staff_item_detail(
         )
     rows = ""
     for c in claims:
+        action_time = fmt_time(c["withdrawn_at"]) if c["status"] == "withdrawn" else fmt_time(c["decided_at"])
         rows += (
             "<tr>"
             f'<td><a href="/staff/claims/{c["id"]}">#{c["id"]}</a></td>'
@@ -347,9 +378,10 @@ def staff_item_detail(
             f"<td>{e(c['answer'])}</td>"
             f"<td>{e(c['contact'])}</td>"
             f"<td>{fmt_time(c['created_at'])}</td>"
+            f"<td>{action_time}</td>"
             "</tr>"
         )
-    rows = rows or '<tr><td colspan="5" class="muted">暂无认领申请。</td></tr>'
+    rows = rows or '<tr><td colspan="6" class="muted">暂无认领申请。</td></tr>'
     body = f"""
     <div class="card">
       <h1>物品 #{item['id']} {item_badge(item['status'])}</h1>
@@ -362,7 +394,7 @@ def staff_item_detail(
     </div>
     <div class="card">
       <h1>认领申请（含私密答案与联系方式，仅工作人员可见）</h1>
-      <table><thead><tr><th>申请</th><th>状态</th><th>辨认答案</th><th>联系方式</th><th>提交时间</th></tr></thead>
+      <table><thead><tr><th>申请</th><th>状态</th><th>辨认答案</th><th>联系方式</th><th>提交时间</th><th>处理/撤回时间</th></tr></thead>
       <tbody>{rows}</tbody></table>
     </div>
     {_corrections_card(corrections)}"""
@@ -389,6 +421,10 @@ def staff_claim_detail(
     code_panel = "<p class=\"muted\">尚未选定，暂无交还码。</p>"
     if claim["status"] == "selected":
         code_panel = _code_panel(claim, active_code, csrf_token, plain_code)
+    withdrawn_line = ""
+    if claim["status"] == "withdrawn":
+        withdrawn_line = f"<dt>撤回时间</dt><dd>{fmt_time(claim['withdrawn_at'])}</dd>"
+        code_panel = '<p class="muted">该申请已被申请人主动撤回，无交还码。</p>'
     rejudge_panel = _rejudge_panel(claim, sibling_claims, csrf_token)
     body = f"""
     <div class="card">
@@ -401,6 +437,7 @@ def staff_claim_detail(
         <dt>联系方式</dt><dd>{e(claim['contact'])}</dd>
         <dt>提交时间</dt><dd>{fmt_time(claim['created_at'])}</dd>
         <dt>处理时间</dt><dd>{fmt_time(claim['decided_at'])}</dd>
+        {withdrawn_line}
       </dl>
       <div class="row">{select_btn}<a class="btn secondary" href="/staff/items/{claim['item_id']}">返回物品</a></div>
     </div>
